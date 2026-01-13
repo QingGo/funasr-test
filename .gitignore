@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Audio files
+*.npy
+*.wav
+
+# Recording files
+recording_*.npy
+
+# Debug files
+debug_*.npy
+debug_*.wav
+
+.trae/documents/
+outputs/
