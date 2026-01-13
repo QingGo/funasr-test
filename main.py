@@ -89,115 +89,165 @@ def calculate_similarity(text1, text2):
         return 0.0
     return len(common) / len(set2)
 
+def merge_stream_text(current_text, new_text):
+    if not new_text:
+        return current_text
+    if not current_text:
+        return new_text
+    if new_text in current_text:
+        return current_text
+
+    max_overlap = 0
+    max_len = min(len(current_text), len(new_text))
+    for i in range(1, max_len + 1):
+        if current_text[-i:] == new_text[:i]:
+            max_overlap = i
+    return current_text + new_text[max_overlap:]
+
+def stream_recognition_from_samples(sample_iter, label=""):
+    global all_audio_data
+
+    cache = {}
+    full_text = ""
+    audio_cache = []
+    chunk_size = [0, 10, 5]
+    chunk_stride_samples = int(chunk_size[1] * 960)  # 600ms
+    max_buffer = max(WINDOW_SIZE, chunk_stride_samples)
+
+    if label:
+        print(label)
+
+    for audio_chunk in sample_iter:
+        if not is_running:
+            break
+
+        # 保存到全局音频数据中
+        all_audio_data.extend(audio_chunk)
+
+        # 添加到滑动窗口缓存
+        audio_cache.extend(audio_chunk)
+        if len(audio_cache) > max_buffer:
+            audio_cache = audio_cache[-max_buffer:]
+
+        # 计算当前音量
+        current_volume = np.abs(audio_chunk).mean()
+
+        # 音量状态指示
+        if current_volume < volume_threshold:
+            volume_status = "🔇 静音"
+        elif current_volume < volume_threshold * 2:
+            volume_status = "🔉 小声"
+        elif current_volume < volume_threshold * 5:
+            volume_status = "🔊 正常"
+        else:
+            volume_status = "🔊🔊 大声"
+
+        # 按 600ms 步长累积后送入模型，避免过短块导致输出卡在“嗯”
+        if len(audio_cache) < chunk_stride_samples:
+            debug_info = (
+                f"\r{volume_status} | 音量: {current_volume:5.1f} | "
+                f"缓存: {len(audio_cache):4d} | 识别结果: {full_text}"
+            )
+            print(debug_info, end="", flush=True)
+            continue
+
+        processed_audio = preprocess_audio(np.array(audio_cache[:chunk_stride_samples]), gain=gain)
+        audio_cache = audio_cache[chunk_stride_samples:]
+
+        recognize_start = time.time()
+        res = model.generate(
+            input=processed_audio,
+            cache=cache,
+            is_final=False,
+            chunk_size=chunk_size,
+            encoder_chunk_look_back=2,
+            decoder_chunk_look_back=1,
+            disable_pbar=True,
+            disable_log=True
+        )
+        recognize_delay = (time.time() - recognize_start) * 1000
+
+        partial_text = res[0]["text"] if (res and res[0]["text"]) else ""
+        if partial_text:
+            full_text = merge_stream_text(full_text, partial_text)
+
+        debug_info = (
+            f"\r{volume_status} | 音量: {current_volume:5.1f} | "
+            f"延迟: {recognize_delay:4.1f}ms | 识别结果: {full_text}"
+        )
+        print(debug_info, end="", flush=True)
+
+    # flush remaining cache
+    if audio_cache:
+        processed_audio = preprocess_audio(np.array(audio_cache), gain=gain)
+        res = model.generate(
+            input=processed_audio,
+            cache=cache,
+            is_final=True,
+            chunk_size=chunk_size,
+            encoder_chunk_look_back=2,
+            decoder_chunk_look_back=1,
+            disable_pbar=True,
+            disable_log=True
+        )
+    else:
+        res = model.generate(
+            input=np.array([], dtype=np.int16),
+            cache=cache,
+            is_final=True,
+            chunk_size=chunk_size,
+            encoder_chunk_look_back=2,
+            decoder_chunk_look_back=1,
+            disable_pbar=True,
+            disable_log=True
+        )
+
+    if res and res[0]["text"]:
+        full_text = merge_stream_text(full_text, res[0]["text"])
+        print(f"\n📝 最终流式识别结果: {full_text}")
+
+    return full_text
+
 # 麦克风实时录音和识别
 def real_time_recognition():
     global is_running, all_audio_data
-    
+
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT,
                     channels=CHANNELS,
                     rate=SAMPLE_RATE,
                     input=True,
                     frames_per_buffer=CHUNK)
-    
+
     print("🎤 开始实时录音和识别...")
     print("   按 Ctrl+C 停止\n")
-    
-    # 初始化音频缓存
-    audio_cache = []
-    cache = {}
-    last_text = ""
-    start_time = time.time()
-    
-    try:
+
+    def mic_iter():
         while is_running:
-            # 读取音频数据
             data = stream.read(CHUNK, exception_on_overflow=False)
-            audio_chunk = np.frombuffer(data, dtype=np.int16)
-            
-            # 保存到全局音频数据中
-            all_audio_data.extend(audio_chunk)
-            
-            # 添加到滑动窗口缓存
-            audio_cache.extend(audio_chunk)
-            
-            # 保持缓存大小
-            if len(audio_cache) > WINDOW_SIZE:
-                audio_cache = audio_cache[-WINDOW_SIZE:]
-            
-            # 计算当前音量
-            current_volume = np.abs(audio_chunk).mean()
-            
-            # 音量状态指示
-            if current_volume < volume_threshold:
-                volume_status = "🔇 静音"
-            elif current_volume < volume_threshold * 2:
-                volume_status = "🔉 小声"
-            elif current_volume < volume_threshold * 5:
-                volume_status = "🔊 正常"
-            else:
-                volume_status = "🔊🔊 大声"
-            
-            # 更频繁的识别：当缓存达到STEP_SIZE就进行识别
-            if len(audio_cache) >= STEP_SIZE:
-                processed_audio = preprocess_audio(np.array(audio_cache), gain=gain)
-                
-                # 记录识别开始时间
-                recognize_start = time.time()
-                
-                # 流式识别
-                res = model.generate(
-                    input=processed_audio,
-                    cache=cache,
-                    is_final=False,
-                    chunk_size=[0, 10, 5],
-                    encoder_chunk_look_back=2,
-                    decoder_chunk_look_back=1,
-                    disable_pbar=True,
-                    disable_log=True
-                )
-                
-                # 计算识别延迟
-                recognize_delay = (time.time() - recognize_start) * 1000
-                
-                if res and res[0]['text']:
-                    last_text = res[0]['text']
-                    # 显示更多调试信息
-                    debug_info = f"\r{volume_status} | 音量: {current_volume:5.1f} | 缓存: {len(audio_cache):4d} | 延迟: {recognize_delay:4.1f}ms | 识别结果: {last_text}"
-                    print(debug_info, end="", flush=True)
-                    
-                    # 自动验证
-                    if args.benchmark:
-                        similarity = calculate_similarity(last_text, args.benchmark)
-                        if similarity >= 0.7:
-                            print(f"\n✅ 识别结果与基准文本匹配，相似度: {similarity:.2f}")
-                            is_running = False
-                else:
-                    # 即使没有识别结果，也显示调试信息
-                    debug_info = f"\r{volume_status} | 音量: {current_volume:5.1f} | 缓存: {len(audio_cache):4d} | 延迟: {recognize_delay:4.1f}ms | 识别结果: {last_text}"
-                    print(debug_info, end="", flush=True)
-    
+            yield np.frombuffer(data, dtype=np.int16)
+
+    try:
+        result = stream_recognition_from_samples(mic_iter())
     except Exception as e:
         print(f"\n录音出错: {e}")
-    
+        result = ""
     finally:
         # 清理资源
         stream.stop_stream()
         stream.close()
         p.terminate()
-        
+
         # 保存录音
-        recorded_file = None
         if all_audio_data:
-            recorded_file = save_recording(np.array(all_audio_data))
-        
+            save_recording(np.array(all_audio_data))
+
         # 使用完整音频进行最终识别
         if all_audio_data:
             print("\n\n🔍 使用完整录音进行最终识别...")
             full_audio = np.array(all_audio_data)
             processed_full = preprocess_audio(full_audio)
-            
-            # 重置缓存，使用完整音频进行识别
+
             full_cache = {}
             res = model.generate(
                 input=processed_full,
@@ -209,34 +259,15 @@ def real_time_recognition():
                 disable_pbar=True,
                 disable_log=True
             )
-            
+
             if res and res[0]['text']:
                 final_text = res[0]['text']
                 print(f"📝 完整录音识别结果: {final_text}")
-                if last_text:
-                    print(f"🔄 实时识别结果: {last_text}")
+                if result:
+                    print(f"🔄 实时识别结果: {result}")
                 return final_text
-        
-        # 如果没有完整音频，使用最后一个缓存
-        elif audio_cache:
-            final_processed = preprocess_audio(np.array(audio_cache))
-            res = model.generate(
-                input=final_processed,
-                cache=cache,
-                is_final=True,
-                chunk_size=[0, 10, 5],
-                encoder_chunk_look_back=2,
-                decoder_chunk_look_back=1,
-                disable_pbar=True,
-                disable_log=True
-            )
-            
-            if res and res[0]['text']:
-                final_text = res[0]['text']
-                print(f"\n最终识别结果: {final_text}")
-                return final_text
-    
-    return last_text
+
+    return result
 
 # 音频文件流式重放
 def file_streaming_recognition(audio_file):
@@ -244,44 +275,18 @@ def file_streaming_recognition(audio_file):
     
     print(f"📁 使用录音文件进行测试: {audio_file}")
     audio_data = np.load(audio_file)
-    all_audio_data = audio_data.copy()
+    all_audio_data = audio_data.tolist()
     
     print(f"音频时长: {len(audio_data)/16000:.2f}秒")
     print(f"平均音量: {np.abs(audio_data).mean():.2f}")
-    print("\n开始流式识别...")
     
-    # 1. 直接使用完整音频进行流式识别（已知可以得到正确结果）
-    cache = {}
-    processed_audio = preprocess_audio(audio_data, gain=gain)
-    
-    res = model.generate(
-        input=processed_audio,
-        cache=cache,
-        is_final=False,
-        chunk_size=[0, 10, 5],
-        encoder_chunk_look_back=2,
-        decoder_chunk_look_back=1,
-        disable_pbar=True,
-        disable_log=True
-    )
-    
-    if res and res[0]['text']:
-        print(f"\n中间识别结果: {res[0]['text']}")
-    
-    res = model.generate(
-        input=np.array([], dtype=np.int16),
-        cache=cache,
-        is_final=True,
-        chunk_size=[0, 10, 5],
-        encoder_chunk_look_back=2,
-        decoder_chunk_look_back=1,
-        disable_pbar=True,
-        disable_log=True
-    )
-    
-    final_text = res[0]['text'] if (res and res[0]['text']) else ""
-    print(f"最终识别结果: {final_text}")
-    
+    # 1. 按实时流式方式分块送入模型，复现实时行为
+    def file_iter():
+        for i in range(0, len(audio_data), CHUNK):
+            yield audio_data[i:i + CHUNK]
+
+    final_text = stream_recognition_from_samples(file_iter(), label="\n开始流式识别...")
+    print(f"\n最终识别结果: {final_text}")
     return final_text
 
 # 主流程
