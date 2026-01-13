@@ -1,84 +1,113 @@
-import pyaudio
-import numpy as np
-from funasr import AutoModel
-import logging
-import time
 import argparse
+import logging
 import signal
-import os
+import time
+from dataclasses import dataclass
+
+import numpy as np
+import pyaudio
+from funasr import AutoModel
 
 # 屏蔽繁杂日志
 logging.getLogger("modelscope").setLevel(logging.ERROR)
 logging.getLogger("funasr").setLevel(logging.ERROR)
 
-# 全局变量
-is_running = True
-cleanup_called = False
-all_audio_data = []
 
-# 信号处理
-def signal_handler(sig, frame):
-    global is_running
+@dataclass(frozen=True)
+class AudioConfig:
+    sample_rate: int = 16000
+    chunk: int = 960  # 60ms
+    window_size: int = 4800  # 300ms
+    step_size: int = 960  # 60ms
+    format: int = pyaudio.paInt16
+    channels: int = 1
+
+
+@dataclass(frozen=True)
+class StreamConfig:
+    chunk_size: tuple = (0, 10, 5)
+    encoder_chunk_look_back: int = 2
+    decoder_chunk_look_back: int = 1
+
+
+@dataclass
+class RuntimeState:
+    is_running: bool = True
+    all_audio_data: list = None
+
+    def __post_init__(self):
+        if self.all_audio_data is None:
+            self.all_audio_data = []
+
+
+def signal_handler(sig, frame, state: RuntimeState):
     print("\n收到退出信号，正在停止...")
-    is_running = False
+    state.is_running = False
 
-# 命令行参数解析
-parser = argparse.ArgumentParser(description="FunASR 实时语音识别系统")
-parser.add_argument("--audio_file", type=str, help="录音文件路径，用于流式重放测试")
-parser.add_argument("--benchmark", type=str, help="基准文本，用于自动验证")
-parser.add_argument("--mic", action="store_true", help="使用麦克风实时输入")
-parser.add_argument("--gain", type=float, default=3.0, help="音频增益调整，默认3.0")
-parser.add_argument("--threshold", type=float, default=100.0, help="音量阈值，低于此值视为静音，默认100.0")
-args = parser.parse_args()
 
-print("=== FunASR 实时语音识别系统 ===")
-print("支持实时麦克风输入、滑动窗口、录音保存和自动验证功能\n")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="FunASR 实时语音识别系统")
+    parser.add_argument("--audio_file", type=str, help="录音文件路径，用于流式重放测试")
+    parser.add_argument("--benchmark", type=str, help="基准文本，用于自动验证")
+    parser.add_argument("--mic", action="store_true", help="使用麦克风实时输入")
+    parser.add_argument("--gain", type=float, default=3.0, help="音频增益调整，默认3.0")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=100.0,
+        help="音量阈值，低于此值视为静音，默认100.0",
+    )
+    return parser
 
-# 音频配置
-SAMPLE_RATE = 16000
-CHUNK = 960  # 60ms，每次读取的音频块大小
-WINDOW_SIZE = 4800  # 300ms，滑动窗口大小
-STEP_SIZE = 960     # 60ms，滑动步长
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-gain = args.gain
-volume_threshold = args.threshold
 
-print(f"🎛️  配置参数:")
-print(f"   CHUNK: {CHUNK} ({CHUNK/SAMPLE_RATE*1000:.0f}ms)")
-print(f"   滑动窗口: {WINDOW_SIZE} ({WINDOW_SIZE/SAMPLE_RATE*1000:.0f}ms)")
-print(f"   滑动步长: {STEP_SIZE} ({STEP_SIZE/SAMPLE_RATE*1000:.0f}ms)")
-print(f"   采样率: {SAMPLE_RATE}Hz")
-print(f"   音频增益: {gain}")
-print(f"   音量阈值: {volume_threshold}")
-print()
+def print_banner(audio_cfg: AudioConfig, gain: float, volume_threshold: float) -> None:
+    print("=== FunASR 实时语音识别系统 ===")
+    print("支持实时麦克风输入、滑动窗口、录音保存和自动验证功能\n")
+    print("🎛️  配置参数:")
+    print(
+        f"   CHUNK: {audio_cfg.chunk} ({audio_cfg.chunk / audio_cfg.sample_rate * 1000:.0f}ms)"
+    )
+    print(
+        f"   滑动窗口: {audio_cfg.window_size} "
+        f"({audio_cfg.window_size / audio_cfg.sample_rate * 1000:.0f}ms)"
+    )
+    print(
+        f"   滑动步长: {audio_cfg.step_size} "
+        f"({audio_cfg.step_size / audio_cfg.sample_rate * 1000:.0f}ms)"
+    )
+    print(f"   采样率: {audio_cfg.sample_rate}Hz")
+    print(f"   音频增益: {gain}")
+    print(f"   音量阈值: {volume_threshold}")
+    print()
 
-# 加载模型
-print("正在加载模型...")
-model = AutoModel(
-    model="paraformer-zh-streaming", 
-    model_revision="v2.0.4",
-    disable_update=True,
-    verbose=False
-)
-print("模型加载完成！\n")
 
-# 音频预处理
-def preprocess_audio(audio_chunk, gain=3.0):
+def load_model() -> AutoModel:
+    print("正在加载模型...")
+    model = AutoModel(
+        model="paraformer-zh-streaming",
+        model_revision="v2.0.4",
+        disable_update=True,
+        verbose=False,
+    )
+    print("模型加载完成！\n")
+    return model
+
+
+def preprocess_audio(audio_chunk: np.ndarray, gain: float) -> np.ndarray:
     processed = audio_chunk.astype(np.float32) * gain
     processed = np.clip(processed, -32768, 32767)
     return processed.astype(np.int16)
 
-# 保存录音
-def save_recording(audio_data):
+
+def save_recording(audio_data: np.ndarray) -> str:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filename = f"recording_{timestamp}.npy"
     np.save(filename, audio_data)
     print(f"\n录音已保存为: {filename}")
     return filename
 
-# 相似度计算
-def calculate_similarity(text1, text2):
+
+def calculate_similarity(text1: str, text2: str) -> float:
     """使用集合相似度计算文本相似度"""
     if not text1 or not text2:
         return 0.0
@@ -89,7 +118,8 @@ def calculate_similarity(text1, text2):
         return 0.0
     return len(common) / len(set2)
 
-def merge_stream_text(current_text, new_text):
+
+def merge_stream_text(current_text: str, new_text: str) -> str:
     if not new_text:
         return current_text
     if not current_text:
@@ -97,6 +127,7 @@ def merge_stream_text(current_text, new_text):
     if new_text in current_text:
         return current_text
 
+    # 处理流式输出的前后重叠，避免重复字
     max_overlap = 0
     max_len = min(len(current_text), len(new_text))
     for i in range(1, max_len + 1):
@@ -104,35 +135,40 @@ def merge_stream_text(current_text, new_text):
             max_overlap = i
     return current_text + new_text[max_overlap:]
 
-def stream_recognition_from_samples(sample_iter, label=""):
-    global all_audio_data
 
+def stream_recognition_from_samples(
+    sample_iter,
+    model: AutoModel,
+    audio_cfg: AudioConfig,
+    stream_cfg: StreamConfig,
+    state: RuntimeState,
+    gain: float,
+    volume_threshold: float,
+    label: str = "",
+) -> str:
     cache = {}
     full_text = ""
     audio_cache = []
-    chunk_size = [0, 10, 5]
-    chunk_stride_samples = int(chunk_size[1] * 960)  # 600ms
-    max_buffer = max(WINDOW_SIZE, chunk_stride_samples)
+    # stream_cfg.chunk_size[1] 以 60ms 为单位，10 -> 600ms
+    chunk_stride_samples = int(stream_cfg.chunk_size[1] * 960)
+    max_buffer = max(audio_cfg.window_size, chunk_stride_samples)
 
     if label:
         print(label)
 
     for audio_chunk in sample_iter:
-        if not is_running:
+        if not state.is_running:
             break
 
-        # 保存到全局音频数据中
-        all_audio_data.extend(audio_chunk)
+        # 记录全部音频用于最终识别/回放
+        state.all_audio_data.extend(audio_chunk)
 
-        # 添加到滑动窗口缓存
+        # 累积缓存，直到达到模型需要的步长
         audio_cache.extend(audio_chunk)
         if len(audio_cache) > max_buffer:
             audio_cache = audio_cache[-max_buffer:]
 
-        # 计算当前音量
         current_volume = np.abs(audio_chunk).mean()
-
-        # 音量状态指示
         if current_volume < volume_threshold:
             volume_status = "🔇 静音"
         elif current_volume < volume_threshold * 2:
@@ -142,7 +178,6 @@ def stream_recognition_from_samples(sample_iter, label=""):
         else:
             volume_status = "🔊🔊 大声"
 
-        # 按 600ms 步长累积后送入模型，避免过短块导致输出卡在“嗯”
         if len(audio_cache) < chunk_stride_samples:
             debug_info = (
                 f"\r{volume_status} | 音量: {current_volume:5.1f} | "
@@ -151,7 +186,10 @@ def stream_recognition_from_samples(sample_iter, label=""):
             print(debug_info, end="", flush=True)
             continue
 
-        processed_audio = preprocess_audio(np.array(audio_cache[:chunk_stride_samples]), gain=gain)
+        processed_audio = preprocess_audio(
+            np.array(audio_cache[:chunk_stride_samples]),
+            gain=gain,
+        )
         audio_cache = audio_cache[chunk_stride_samples:]
 
         recognize_start = time.time()
@@ -159,11 +197,11 @@ def stream_recognition_from_samples(sample_iter, label=""):
             input=processed_audio,
             cache=cache,
             is_final=False,
-            chunk_size=chunk_size,
-            encoder_chunk_look_back=2,
-            decoder_chunk_look_back=1,
+            chunk_size=list(stream_cfg.chunk_size),
+            encoder_chunk_look_back=stream_cfg.encoder_chunk_look_back,
+            decoder_chunk_look_back=stream_cfg.decoder_chunk_look_back,
             disable_pbar=True,
-            disable_log=True
+            disable_log=True,
         )
         recognize_delay = (time.time() - recognize_start) * 1000
 
@@ -184,22 +222,22 @@ def stream_recognition_from_samples(sample_iter, label=""):
             input=processed_audio,
             cache=cache,
             is_final=True,
-            chunk_size=chunk_size,
-            encoder_chunk_look_back=2,
-            decoder_chunk_look_back=1,
+            chunk_size=list(stream_cfg.chunk_size),
+            encoder_chunk_look_back=stream_cfg.encoder_chunk_look_back,
+            decoder_chunk_look_back=stream_cfg.decoder_chunk_look_back,
             disable_pbar=True,
-            disable_log=True
+            disable_log=True,
         )
     else:
         res = model.generate(
             input=np.array([], dtype=np.int16),
             cache=cache,
             is_final=True,
-            chunk_size=chunk_size,
-            encoder_chunk_look_back=2,
-            decoder_chunk_look_back=1,
+            chunk_size=list(stream_cfg.chunk_size),
+            encoder_chunk_look_back=stream_cfg.encoder_chunk_look_back,
+            decoder_chunk_look_back=stream_cfg.decoder_chunk_look_back,
             disable_pbar=True,
-            disable_log=True
+            disable_log=True,
         )
 
     if res and res[0]["text"]:
@@ -208,27 +246,73 @@ def stream_recognition_from_samples(sample_iter, label=""):
 
     return full_text
 
-# 麦克风实时录音和识别
-def real_time_recognition():
-    global is_running, all_audio_data
 
+def final_full_recognition(
+    model: AutoModel,
+    stream_cfg: StreamConfig,
+    audio_data: list,
+    gain: float,
+) -> str:
+    if not audio_data:
+        return ""
+
+    print("\n\n🔍 使用完整录音进行最终识别...")
+    full_audio = np.array(audio_data)
+    processed_full = preprocess_audio(full_audio, gain=gain)
+
+    res = model.generate(
+        input=processed_full,
+        cache={},
+        is_final=True,
+        chunk_size=list(stream_cfg.chunk_size),
+        encoder_chunk_look_back=stream_cfg.encoder_chunk_look_back,
+        decoder_chunk_look_back=stream_cfg.decoder_chunk_look_back,
+        disable_pbar=True,
+        disable_log=True,
+    )
+
+    if res and res[0]["text"]:
+        final_text = res[0]["text"]
+        print(f"📝 完整录音识别结果: {final_text}")
+        return final_text
+    return ""
+
+
+def real_time_recognition(
+    model: AutoModel,
+    audio_cfg: AudioConfig,
+    stream_cfg: StreamConfig,
+    state: RuntimeState,
+    gain: float,
+    volume_threshold: float,
+) -> str:
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=SAMPLE_RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
+    stream = p.open(
+        format=audio_cfg.format,
+        channels=audio_cfg.channels,
+        rate=audio_cfg.sample_rate,
+        input=True,
+        frames_per_buffer=audio_cfg.chunk,
+    )
 
     print("🎤 开始实时录音和识别...")
     print("   按 Ctrl+C 停止\n")
 
     def mic_iter():
-        while is_running:
-            data = stream.read(CHUNK, exception_on_overflow=False)
+        while state.is_running:
+            data = stream.read(audio_cfg.chunk, exception_on_overflow=False)
             yield np.frombuffer(data, dtype=np.int16)
 
     try:
-        result = stream_recognition_from_samples(mic_iter())
+        result = stream_recognition_from_samples(
+            mic_iter(),
+            model=model,
+            audio_cfg=audio_cfg,
+            stream_cfg=stream_cfg,
+            state=state,
+            gain=gain,
+            volume_threshold=volume_threshold,
+        )
     except Exception as e:
         print(f"\n录音出错: {e}")
         result = ""
@@ -239,86 +323,107 @@ def real_time_recognition():
         p.terminate()
 
         # 保存录音
-        if all_audio_data:
-            save_recording(np.array(all_audio_data))
-
-        # 使用完整音频进行最终识别
-        if all_audio_data:
-            print("\n\n🔍 使用完整录音进行最终识别...")
-            full_audio = np.array(all_audio_data)
-            processed_full = preprocess_audio(full_audio)
-
-            full_cache = {}
-            res = model.generate(
-                input=processed_full,
-                cache=full_cache,
-                is_final=True,
-                chunk_size=[0, 10, 5],
-                encoder_chunk_look_back=2,
-                decoder_chunk_look_back=1,
-                disable_pbar=True,
-                disable_log=True
-            )
-
-            if res and res[0]['text']:
-                final_text = res[0]['text']
-                print(f"📝 完整录音识别结果: {final_text}")
-                if result:
-                    print(f"🔄 实时识别结果: {result}")
-                return final_text
+        if state.all_audio_data:
+            save_recording(np.array(state.all_audio_data))
 
     return result
 
-# 音频文件流式重放
-def file_streaming_recognition(audio_file):
-    global all_audio_data
-    
+
+def file_streaming_recognition(
+    audio_file: str,
+    model: AutoModel,
+    audio_cfg: AudioConfig,
+    stream_cfg: StreamConfig,
+    state: RuntimeState,
+    gain: float,
+    volume_threshold: float,
+) -> str:
     print(f"📁 使用录音文件进行测试: {audio_file}")
     audio_data = np.load(audio_file)
-    all_audio_data = audio_data.tolist()
-    
-    print(f"音频时长: {len(audio_data)/16000:.2f}秒")
-    print(f"平均音量: {np.abs(audio_data).mean():.2f}")
-    
-    # 1. 按实时流式方式分块送入模型，复现实时行为
-    def file_iter():
-        for i in range(0, len(audio_data), CHUNK):
-            yield audio_data[i:i + CHUNK]
+    state.all_audio_data = audio_data.tolist()
 
-    final_text = stream_recognition_from_samples(file_iter(), label="\n开始流式识别...")
+    print(f"音频时长: {len(audio_data) / audio_cfg.sample_rate:.2f}秒")
+    print(f"平均音量: {np.abs(audio_data).mean():.2f}")
+
+    def file_iter():
+        for i in range(0, len(audio_data), audio_cfg.chunk):
+            yield audio_data[i : i + audio_cfg.chunk]
+
+    final_text = stream_recognition_from_samples(
+        file_iter(),
+        model=model,
+        audio_cfg=audio_cfg,
+        stream_cfg=stream_cfg,
+        state=state,
+        gain=gain,
+        volume_threshold=volume_threshold,
+        label="\n开始流式识别...",
+    )
     print(f"\n最终识别结果: {final_text}")
     return final_text
 
-# 主流程
-def main():
-    global is_running
-    
-    # 注册信号处理
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    result = ""
-    
+
+def run_benchmark(result: str, benchmark: str) -> None:
+    if not benchmark or not result:
+        return
+
+    print("\n✅ 自动验证:")
+    print(f"   基准文本: {benchmark}")
+    print(f"   识别结果: {result}")
+    similarity = calculate_similarity(result, benchmark)
+    print(f"   相似度: {similarity:.2f}")
+    if similarity >= 0.7:
+        print("   验证状态: 通过 ✅")
+    else:
+        print("   验证状态: 未通过 ❌")
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+
+    audio_cfg = AudioConfig()
+    stream_cfg = StreamConfig()
+    state = RuntimeState()
+
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, state))
+
+    print_banner(audio_cfg, gain=args.gain, volume_threshold=args.threshold)
+    model = load_model()
+
     if args.audio_file:
-        # 使用音频文件测试
-        result = file_streaming_recognition(args.audio_file)
+        result = file_streaming_recognition(
+            args.audio_file,
+            model=model,
+            audio_cfg=audio_cfg,
+            stream_cfg=stream_cfg,
+            state=state,
+            gain=args.gain,
+            volume_threshold=args.threshold,
+        )
     elif args.mic:
-        # 使用麦克风实时输入
-        result = real_time_recognition()
+        result = real_time_recognition(
+            model=model,
+            audio_cfg=audio_cfg,
+            stream_cfg=stream_cfg,
+            state=state,
+            gain=args.gain,
+            volume_threshold=args.threshold,
+        )
+        final_text = final_full_recognition(
+            model=model,
+            stream_cfg=stream_cfg,
+            audio_data=state.all_audio_data,
+            gain=args.gain,
+        )
+        if final_text:
+            print(f"🔄 实时识别结果: {result}")
+            result = final_text
     else:
         print("请指定 --mic 使用麦克风，或 --audio_file 指定音频文件")
         return
-    
-    # 自动验证
-    if args.benchmark and result:
-        print(f"\n✅ 自动验证:")
-        print(f"   基准文本: {args.benchmark}")
-        print(f"   识别结果: {result}")
-        similarity = calculate_similarity(result, args.benchmark)
-        print(f"   相似度: {similarity:.2f}")
-        if similarity >= 0.7:
-            print(f"   验证状态: 通过 ✅")
-        else:
-            print(f"   验证状态: 未通过 ❌")
+
+    run_benchmark(result, args.benchmark)
+
 
 if __name__ == "__main__":
     main()
